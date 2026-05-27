@@ -1,0 +1,16 @@
+# NLP & ML
+langdetect==1.0.9
+sentence-transformers==2.7.0
+transformers==4.40.0
+torch
+textblob==0.18.0
+nltk==3.8.1
+
+# Data
+pandas==2.2.2
+numpy==1.26.4
+requests==2.31.0
+
+# Dashboard
+streamlit==1.35.0
+plotly==5.22.0

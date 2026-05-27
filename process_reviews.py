@@ -1,260 +1,256 @@
 """
 process_reviews.py
 ───────────────────
-Reads from Google Sheets (public CSV - no credentials needed to read),
-processes each review using structured context fields first, NLP second,
-writes results back via Google Apps Script (no credentials needed to write).
+WHERE TO RUN: locally on your laptop, OR automatically via GitHub Actions weekly.
+WHAT IT DOES:
+  1. Reads "raw_reviews" tab from your Google Sheet (public CSV, no auth)
+  2. Scores each review using: Google ratings > context fields > NLP text
+  3. Writes results to "processed" tab via Apps Script (no auth)
 
-HOW DATA FLOWS:
-  Make.com (Apify → Apps Script) → Google Sheets "raw_reviews" tab
-      ↓  [this script reads it — no auth needed if sheet is public]
-  process_reviews.py
-      ↓  [writes via Apps Script webhook — no auth needed]
-  Google Sheets "processed" tab
-      ↓
-  Streamlit dashboard reads via public CSV URL
+BEFORE RUNNING:
+  Fill in SHEET_ID, RAW_GID, and APPS_SCRIPT_URL below.
 
-NO API KEYS NEEDED in this script at all.
-Set your sheet to "Anyone with link can view" and paste the IDs below.
+HOW TO RUN:
+  python src/process_reviews.py
+
+DEPENDENCIES:
+  pip install -r requirements.txt
 """
 
-import re
-import json
-import time
-import requests
+import os, re, json, time, requests
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from io import StringIO
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIG — fill these in, no credentials needed
+# CONFIG — fill these in once, then never touch again
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Your Google Sheet ID — from the URL:
-# https://docs.google.com/spreadsheets/d/THIS_PART_HERE/edit
-SHEET_ID = "YOUR_SHEET_ID_HERE"
+# From your Google Sheet URL:
+# https://docs.google.com/spreadsheets/d/THIS_IS_YOUR_ID/edit
+SHEET_ID = '17ADm27u7yICbqD9etdiCNlZb-UlVzqPsbthozTiXgn0'
 
-# GID of each tab — find it in the URL when you click the tab
+# GID of the "raw_reviews" tab — look at URL when you click that tab
 # e.g. https://docs.google.com/spreadsheets/d/.../edit#gid=0
-RAW_REVIEWS_GID  = "0"       # usually 0 for first tab
-PROCESSED_GID    = ""        # leave empty — script creates it via Apps Script
+RAW_GID  = os.environ.get("RAW_GID", "0")
 
-# Your Google Apps Script Web App URL (from Part 2 of deployment guide)
-APPS_SCRIPT_URL = "YOUR_APPS_SCRIPT_URL_HERE"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# READ FROM SHEETS — public CSV, zero auth
-# ─────────────────────────────────────────────────────────────────────────────
-
-def read_sheet_public(sheet_id: str, gid: str) -> pd.DataFrame:
-    """
-    Read any publicly shared Google Sheet tab as CSV.
-    Sheet must be set to 'Anyone with link can view'.
-    No API key, no credentials, no OAuth.
-    """
-    url = (
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}"
-        f"/export?format=csv&gid={gid}"
-    )
-    print(f"Reading sheet: {url[:60]}...")
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-
-    from io import StringIO
-    df = pd.read_csv(StringIO(resp.text))
-    print(f"  Loaded {len(df)} rows, {len(df.columns)} columns")
-    return df
+# Your Google Apps Script Web App URL
+APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwM0bVHTMdPwvEOIsJrvn346KP3dvPA6Cpqck5Fq6FhDGQb7peX2biQU4RtCtYkKN0Q/exec'
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WRITE BACK — via Apps Script webhook, zero auth
+# IMPORTS FROM SAME FOLDER
+# ─────────────────────────────────────────────────────────────────────────────
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+
+from _column_aliases import normalise_row, normalise_columns
+from context_handler import (
+    score_all_context_fields,
+    CONTEXT_TO_SCORE_COL,
+    classify_context_value,
+)
+from aspect_groups_indian import ASPECT_GROUPS
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LAZY-LOAD NLP — only imports heavy models when actually needed
+# ─────────────────────────────────────────────────────────────────────────────
+_sentiment_pipe  = None
+_embed_model     = None
+_aspect_embs     = None
+
+def get_sentiment_pipe():
+    global _sentiment_pipe
+    if _sentiment_pipe is None:
+        from transformers import pipeline
+        print("  Loading sentiment model (first time only)...")
+        _sentiment_pipe = pipeline(
+            "sentiment-analysis",
+            model="nlptown/bert-base-multilingual-uncased-sentiment",
+            truncation=True, max_length=512,
+        )
+        print("  Sentiment model ready.")
+    return _sentiment_pipe
+
+def get_embed_model():
+    global _embed_model, _aspect_embs
+    if _embed_model is None:
+        from sentence_transformers import SentenceTransformer
+        print("  Loading embedding model (first time only)...")
+        _embed_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+        _aspect_embs = {
+            asp: _embed_model.encode(
+                " ".join(data["en"][:10]), convert_to_tensor=True
+            )
+            for asp, data in ASPECT_GROUPS.items()
+        }
+        print("  Embedding model ready.")
+    return _embed_model, _aspect_embs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# READ — public CSV, zero auth required
 # ─────────────────────────────────────────────────────────────────────────────
 
-def write_processed(df: pd.DataFrame, apps_script_url: str):
+def read_raw_reviews() -> pd.DataFrame:
+    if SHEET_ID == "YOUR_SHEET_ID_HERE":
+        print("ERROR: Set SHEET_ID at the top of this file.")
+        print("Find it in your Sheet URL:")
+        print("https://docs.google.com/spreadsheets/d/SHEET_ID/edit")
+        sys.exit(1)
+
+    url = (f"https://docs.google.com/spreadsheets/d/{SHEET_ID}"
+           f"/export?format=csv&gid={RAW_GID}")
+    print(f"Reading raw_reviews from Google Sheets...")
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        # Force UTF-8 so € and – are not mangled into â¬ / â
+        resp.encoding = "utf-8"
+        df = pd.read_csv(StringIO(resp.text), encoding="utf-8")
+        df = normalise_columns(df)  # handles slash vs underscore column names
+        # Fix any remaining encoding issues in string columns
+        for col in df.select_dtypes(include="object").columns:
+            df[col] = df[col].apply(
+                lambda x: x.encode("latin-1").decode("utf-8")
+                if isinstance(x, str) and "â" in x else x
+            )
+        print(f"  Loaded {len(df)} reviews, {len(df.columns)} columns")
+        return df
+    except Exception as e:
+        print(f"ERROR reading sheet: {e}")
+        print("Make sure the sheet is set to 'Anyone with link can view'")
+        sys.exit(1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WRITE — via Apps Script, zero auth required
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fix_encoding(s: str) -> str:
+    """Fix Latin-1 misread UTF-8 strings — e.g. â¬ → €, â → –"""
+    if not isinstance(s, str) or "â" not in s:
+        return s
+    try:
+        return s.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+
+
+def _clean_for_json(records: list) -> list:
     """
-    Send processed results to Apps Script which writes to Sheets.
-    Sends in chunks of 500 rows to stay within HTTP payload limits.
+    - Replace float NaN/Infinity with None (JSON compliance)
+    - Fix any UTF-8/Latin-1 encoding corruption in string values
     """
-    # Convert NaN → None so JSON serialises cleanly
+    import math
+    cleaned = []
+    for row in records:
+        clean_row = {}
+        for k, v in row.items():
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                clean_row[k] = None
+            elif isinstance(v, str):
+                clean_row[k] = _fix_encoding(v)
+            else:
+                clean_row[k] = v
+        cleaned.append(clean_row)
+    return cleaned
+
+
+def write_processed(df: pd.DataFrame):
+    if APPS_SCRIPT_URL == "YOUR_APPS_SCRIPT_URL_HERE":
+        print("ERROR: Set APPS_SCRIPT_URL at the top of this file.")
+        sys.exit(1)
+
+    # Step 1: replace pandas NaN with None
     records = df.where(pd.notnull(df), None).to_dict(orient="records")
 
-    chunk_size = 500
-    total_written = 0
+    # Step 2: replace any remaining float NaN/Inf that slipped through
+    records = _clean_for_json(records)
 
-    for i in range(0, len(records), chunk_size):
-        chunk = records[i:i+chunk_size]
-        payload = {
-            "action":  "write_results",
-            "results": chunk,
-        }
-        resp = requests.post(
-            apps_script_url,
-            json=payload,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        if result.get("status") != "ok":
-            print(f"  Warning: Apps Script returned: {result}")
-        else:
-            total_written += result.get("written", len(chunk))
-            print(f"  Written {min(i+chunk_size, len(records))}/{len(records)} rows")
-        time.sleep(1)
+    total      = len(records)
+    chunk_size = 400
+    chunk_num  = 0
 
-    return total_written
+    print(f"Writing {total} rows to 'processed' tab via Apps Script...")
+    print(f"  Sending in chunks of {chunk_size} rows...")
+
+    written = 0
+    for i in range(0, total, chunk_size):
+        chunk = records[i:i + chunk_size]
+        try:
+            payload_str = json.dumps(
+                {
+                    "action":      "write_results",
+                    "results":     chunk,
+                    "chunk_index": chunk_num,   # 0 = first chunk → clears sheet
+                },
+                allow_nan=False,
+            )
+            resp = requests.post(
+                APPS_SCRIPT_URL,
+                data=payload_str,
+                headers={"Content-Type": "application/json"},
+                timeout=90,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            if result.get("status") != "ok":
+                print(f"  Warning from Apps Script: {result}")
+            else:
+                written += result.get("written", len(chunk))
+                print(f"  {min(i + chunk_size, total)}/{total} rows written "
+                      f"(chunk {chunk_num})")
+            chunk_num += 1
+        except Exception as e:
+            print(f"  ERROR writing chunk {chunk_num} "
+                  f"(rows {i}-{i+chunk_size}): {e}")
+            chunk_num += 1
+        time.sleep(2)   # slightly longer pause — Apps Script needs time between writes
+
+    print(f"Done — {written}/{total} rows in 'processed' tab.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONTEXT FIELD HANDLING
-# These fields contain TEXT labels, not numbers.
-# Strategy:
-#   - Fields with clear positive/negative meaning → convert to 1-5 score
-#   - Fields that are just categories → keep as-is for charts
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Each entry: list of (pattern, score) — checked in order, first match wins
-# Score of None means "keep as category, don't score"
-CONTEXT_SCORE_RULES = {
+def _v(row, *keys):
+    """First non-empty string value from row."""
+    for k in keys:
+        v = row.get(k, "")
+        if v not in (None, "", "nan", float("nan")):
+            return str(v).strip()
+    return ""
 
-    "reviewContext/Noise level": [
-        ("quiet, easy to talk",     5),
-        ("quiet",                   5),
-        ("average",                 3),
-        ("can get pretty noisy",    2),
-        ("very noisy",              1),
-        ("loud",                    1),
-    ],
-
-    "reviewContext/Wait time": [
-        ("no wait",         5),
-        ("up to 10 min",    5),
-        ("10-20 min",       4),
-        ("20-30 min",       3),
-        ("30-45 min",       2),
-        ("45+ min",         1),
-        ("long",            2),
-        ("short",           5),
-    ],
-
-    "reviewContext/Kid-friendliness": [
-        ("amazing",                     5),
-        ("good for kids",               5),
-        ("suitable for children",       5),
-        ("not suitable for children",   2),
-        ("not good for kids",           2),
-    ],
-
-    "reviewContext/Wheelchair accessibility": [
-        ("wheelchair accessible",           5),
-        ("fully accessible",                5),
-        ("accessible",                      4),
-        ("not wheelchair accessible",       1),
-        ("not accessible",                  1),
-        ("limited accessibility",           2),
-    ],
-
-    "reviewContext/Parking": [
-        ("free parking lot",        5),
-        ("free street parking",     4),
-        ("paid parking lot",        3),
-        ("paid street parking",     3),
-        ("parking available",       3),
-        ("no parking available",    1),
-        ("no parking",              1),
-        ("difficult parking",       2),
-    ],
-
-    "reviewContext/Parking options": [
-        ("free",    4),
-        ("paid",    3),
-        ("none",    1),
-    ],
-
-    "reviewContext/Vegetarian options": [
-        ("offers vegetarian options",           4),
-        ("vegetarian options available",        4),
-        ("great vegetarian options",            5),
-        ("limited vegetarian",                  2),
-        ("doesn't offer vegetarian options",    1),
-        ("no vegetarian",                       1),
-    ],
-
-    "reviewContext/Reservation": [
-        ("reservations recommended",    4),
-        ("required",                    4),
-        ("not needed",                  5),   # easy walk-in = positive
-        ("not required",                5),
-    ],
-}
-
-# These context fields stay as raw text — used for categorical charts only
-CATEGORICAL_FIELDS = {
-    "reviewContext/Meal type":         "ctx_meal_type",
-    "reviewContext/Order type":        "ctx_order_type",
-    "reviewContext/Group size":        "ctx_group_size",
-    "reviewContext/Seating type":      "ctx_seating_type",
-    "reviewContext/Dietary restrictions": "ctx_dietary",
-    "reviewContext/Price per person":  "ctx_price_per_person",
-    "reviewContext/Recommended dishes":"ctx_recommended_dishes",
-    "reviewContext/Special events":    "ctx_special_events",
-    "reviewContext/Special offers":    "ctx_special_offers",
-}
-
-def score_context_field(value: str, rules: list) -> float | None:
-    """
-    Given a text value and ordered rules list,
-    return matching score or None if no match.
-    """
-    if not value or str(value).strip() in ("", "nan", "None"):
-        return None
-    v = str(value).strip().lower()
-    for pattern, score in rules:
-        if pattern.lower() in v:
-            return float(score)
+def _f(row, *keys):
+    """First valid float value from row."""
+    for k in keys:
+        try:
+            v = float(row.get(k))
+            if not np.isnan(v):
+                return v
+        except (TypeError, ValueError):
+            pass
     return None
 
+def _first(*args):
+    """First non-None argument."""
+    return next((a for a in args if a is not None), None)
+
+def _avg(*args):
+    vals = [a for a in args if a is not None]
+    return round(sum(vals) / len(vals), 2) if vals else None
+
 # ─────────────────────────────────────────────────────────────────────────────
-# LAZY-LOAD NLP MODELS — only when structured data is insufficient
+# NLP ON TEXT — aspect-based sentence scoring
 # ─────────────────────────────────────────────────────────────────────────────
-_nlp_loaded = False
-_sentiment_pipe = None
-_embed_model = None
-_aspect_embeddings = None
 
-def load_nlp_models():
-    global _nlp_loaded, _sentiment_pipe, _embed_model, _aspect_embeddings
-    if _nlp_loaded:
-        return
-    print("Loading NLP models (first run only)...")
-    from transformers import pipeline
-    from sentence_transformers import SentenceTransformer
-    from aspect_groups_indian import ASPECT_GROUPS
-
-    _sentiment_pipe = pipeline(
-        "sentiment-analysis",
-        model="nlptown/bert-base-multilingual-uncased-sentiment",
-        truncation=True, max_length=512,
-    )
-    _embed_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-    _aspect_embeddings = {
-        aspect: _embed_model.encode(
-            " ".join(data["en"][:10]),
-            convert_to_tensor=True
-        )
-        for aspect, data in ASPECT_GROUPS.items()
-    }
-    _nlp_loaded = True
-    print("Models loaded.")
-
-def run_nlp_on_text(text: str, lang: str) -> dict:
+def run_nlp(text: str, lang: str) -> dict:
     """
-    Run aspect-based sentiment NLP.
-    Returns {aspect_name: score_float}
+    Run aspect-based NLP on review text.
+    Returns {aspect_name: avg_score}
     Only called when Google structured ratings are missing.
     """
-    load_nlp_models()
-
-    from aspect_groups_indian import ASPECT_GROUPS
-    from sentence_transformers import util
     import nltk
+    from sentence_transformers import util
 
     try:
         sentences = nltk.sent_tokenize(text)
@@ -262,39 +258,41 @@ def run_nlp_on_text(text: str, lang: str) -> dict:
         sentences = [s.strip() for s in re.split(r'[.!?]+', text)
                      if len(s.strip()) > 5]
 
-    buckets = {a: [] for a in ASPECT_GROUPS}
-    kw_key  = "fi" if lang.startswith("fi") else "en"
+    buckets  = {a: [] for a in ASPECT_GROUPS}
+    kw_key   = "fi" if lang.startswith("fi") else "en"
+    pipe     = get_sentiment_pipe()
+    em, embs = get_embed_model()
 
     for sent in sentences:
-        sl = sent.lower()
-        if len(sl) < 5:
+        if len(sent.strip()) < 6:
             continue
-
+        sl = sent.lower()
         matched = []
-        # Step 1: keyword match
-        for aspect, data in ASPECT_GROUPS.items():
+
+        # Step 1 — keyword match
+        for asp, data in ASPECT_GROUPS.items():
             keys = set(data.get(kw_key, [])) | set(data.get("en", []))
             if any(re.search(rf'\b{re.escape(k)}\b', sl) for k in keys):
-                matched.append(aspect)
+                matched.append(asp)
 
-        # Step 2: embedding fallback if nothing matched
+        # Step 2 — embedding fallback
         if not matched:
-            emb = _embed_model.encode(sent, convert_to_tensor=True)
-            for aspect, a_emb in _aspect_embeddings.items():
+            emb = em.encode(sent, convert_to_tensor=True)
+            for asp, a_emb in embs.items():
                 if util.cos_sim(emb, a_emb).item() >= 0.38:
-                    matched.append(aspect)
+                    matched.append(asp)
 
         for a in matched:
             buckets[a].append(sent)
 
     result = {}
-    for aspect, sents in buckets.items():
+    for asp, sents in buckets.items():
         if not sents:
             continue
         scores = []
         for s in sents:
             try:
-                label = _sentiment_pipe(s[:512])[0]["label"]
+                label = pipe(s[:512])[0]["label"]
                 scores.append({
                     "1 star":1,"2 stars":2,"3 stars":3,
                     "4 stars":4,"5 stars":5
@@ -302,73 +300,47 @@ def run_nlp_on_text(text: str, lang: str) -> dict:
             except Exception:
                 pass
         if scores:
-            result[aspect] = round(sum(scores) / len(scores), 2)
-
+            result[asp] = round(sum(scores) / len(scores), 2)
     return result
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROW PROCESSOR
+# PROCESS ONE ROW
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _v(row, *keys):
-    """Get first non-empty value from row using multiple key names."""
-    for k in keys:
-        val = row.get(k, "")
-        if val not in (None, "", "nan", float("nan")):
-            return str(val).strip()
-    return ""
-
-def _f(row, *keys):
-    """Get float value."""
-    for k in keys:
-        val = row.get(k)
-        try:
-            f = float(val)
-            if not np.isnan(f):
-                return f
-        except (TypeError, ValueError):
-            pass
-    return None
-
-def _first(*args):
-    """Return first non-None argument."""
-    return next((a for a in args if a is not None), None)
-
 def process_row(row: dict) -> dict:
+    row = normalise_row(row)  # handles slash vs underscore column names
     out = {}
 
-    # ── Restaurant / place info ───────────────────────────────────────────────
-    out["restaurant"]           = _v(row, "title", "name")
-    out["address"]              = _v(row, "address")
-    out["city"]                 = _v(row, "city")
-    out["neighborhood"]         = _v(row, "neighborhood")
-    out["category"]             = _v(row, "categoryName")
-    out["price_range"]          = _v(row, "price")
-    out["place_url"]            = _v(row, "url")
-    out["lat"]                  = _f(row, "location/lat")
-    out["lng"]                  = _f(row, "location/lng")
-    out["place_total_score"]    = _f(row, "totalScore")
-    out["place_reviews_count"]  = _f(row, "reviewsCount")
-    out["place_permanently_closed"] = _v(row, "permanentlyClosed")
+    # ── Restaurant / place metadata ───────────────────────────────────────────
+    out["restaurant"]        = _v(row, "title", "name")
+    out["address"]           = _v(row, "address")
+    out["city"]              = _v(row, "city")
+    out["neighborhood"]      = _v(row, "neighborhood")
+    out["category"]          = _v(row, "categoryName")
+    out["price_range"]       = _v(row, "price")
+    out["place_url"]         = _v(row, "url")
+    out["lat"]               = _f(row, "location/lat")
+    out["lng"]               = _f(row, "location/lng")
+    out["place_total_score"] = _f(row, "totalScore")
+    out["place_reviews_count"] = _f(row, "reviewsCount")
 
     # ── Review metadata ───────────────────────────────────────────────────────
-    out["review_id"]            = _v(row, "reviewId")
-    out["review_stars"]         = _f(row, "stars", "rating")
-    out["review_date"]          = _v(row, "publishedAtDate", "publishAt")
-    out["visited_in"]           = _v(row, "visitedIn")
-    out["language"]             = _v(row, "language", "originalLanguage")
-    out["original_language"]    = _v(row, "originalLanguage")
-    out["review_origin"]        = _v(row, "reviewOrigin")
-    out["likes_count"]          = _f(row, "likesCount")
-    out["is_local_guide"]       = str(row.get("isLocalGuide","")).lower() == "true"
-    out["reviewer_review_count"]= _f(row, "reviewerNumberOfReviews")
-    out["owner_responded"]      = bool(_v(row, "responseFromOwnerText"))
+    out["review_id"]         = _v(row, "reviewId")
+    out["review_stars"]      = _f(row, "stars", "rating")
+    out["review_date"]       = _v(row, "publishedAtDate", "publishAt")
+    out["visited_in"]        = _v(row, "visitedIn")
+    out["language"]          = _v(row, "language", "originalLanguage")
+    out["original_language"] = _v(row, "originalLanguage")
+    out["likes_count"]       = _f(row, "likesCount")
+    out["is_local_guide"]    = str(row.get("isLocalGuide","")).lower() == "true"
+    out["reviewer_review_count"] = _f(row, "reviewerNumberOfReviews")
+    out["owner_responded"]   = bool(_v(row, "responseFromOwnerText"))
 
     # ── Review text ───────────────────────────────────────────────────────────
-    out["text_original"]        = _v(row, "text")
-    out["text_translated"]      = _v(row, "textTranslated")
+    out["text_original"]   = _v(row, "text")
+    out["text_translated"] = _v(row, "textTranslated")
 
-    # Best text for NLP: prefer translation when original was not English
+    # Use translation for NLP if original was non-English
     orig_lang = out["original_language"].lower()
     out["text_for_nlp"] = (
         out["text_translated"]
@@ -376,86 +348,96 @@ def process_row(row: dict) -> dict:
         else out["text_original"] or out["text_translated"]
     )
 
-    # ── Categorical context fields (keep raw for charts) ─────────────────────
-    for src_col, dest_col in CATEGORICAL_FIELDS.items():
-        out[dest_col] = _v(row, src_col)
+    # ── Process ALL context fields smartly ───────────────────────────────────
+    # context_handler figures out: categorical vs sentence vs short sentiment
+    # and uses the sentiment model on free-text sentences automatically
+    pipe = get_sentiment_pipe() if out["text_for_nlp"] else None
+    ctx_result = score_all_context_fields(row, sentiment_pipe=pipe)
 
-    # ── Score context fields (convert text labels → 1-5) ─────────────────────
-    context_scores = {}
-    for field, rules in CONTEXT_SCORE_RULES.items():
-        val   = _v(row, field)
-        score = score_context_field(val, rules)
-        if score is not None:
-            context_scores[field] = score
+    ctx_scores     = ctx_result["scores"]       # {field: float}
+    ctx_categories = ctx_result["categories"]   # {field: str}
 
-    # ── Google detailed ratings (most reliable — use directly) ────────────────
+    # Save all categorical context values as columns for dashboard filters
+    out["ctx_meal_type"]        = ctx_categories.get("reviewContext/Meal type", "")
+    out["ctx_order_type"]       = ctx_categories.get("reviewContext/Order type", "")
+    out["ctx_group_size"]       = ctx_categories.get("reviewContext/Group size", "")
+    out["ctx_seating_type"]     = ctx_categories.get("reviewContext/Seating type", "")
+    out["ctx_dietary"]          = ctx_categories.get("reviewContext/Dietary restrictions", "")
+    out["ctx_price_per_person"] = ctx_categories.get("reviewContext/Price per person", "")
+    out["ctx_recommended"]      = ctx_categories.get("reviewContext/Recommended dishes", "")
+    out["ctx_special_events"]   = ctx_categories.get("reviewContext/Special events", "")
+    out["ctx_reservation"]      = ctx_categories.get("reviewContext/Reservation", "")
+    out["ctx_noise_raw"]        = ctx_categories.get("reviewContext/Noise level", "")
+    out["ctx_wait_raw"]         = ctx_categories.get("reviewContext/Wait time", "")
+    out["ctx_kid_raw"]          = ctx_categories.get("reviewContext/Kid-friendliness", "")
+    out["ctx_parking_raw"]      = ctx_categories.get("reviewContext/Parking", "")
+    out["ctx_wheelchair_raw"]   = ctx_categories.get("reviewContext/Wheelchair accessibility", "")
+    out["ctx_vegetarian_raw"]   = ctx_categories.get("reviewContext/Vegetarian options", "")
+
+    # Map context scores to our aspect score columns
+    def ctx_score(field):
+        return ctx_scores.get(field)
+
+    # ── Google's own structured ratings ───────────────────────────────────────
     g_food       = _f(row, "reviewDetailedRating/Food")
     g_service    = _f(row, "reviewDetailedRating/Service")
     g_atmosphere = _f(row, "reviewDetailedRating/Atmosphere")
 
-    # ── Decide whether to run NLP ─────────────────────────────────────────────
-    # Only run NLP if Google ratings are missing AND text is long enough
-    has_google_all = all(v is not None for v in [g_food, g_service, g_atmosphere])
-    text_long_enough = len(out["text_for_nlp"]) > 30
+    # ── Decide if NLP is needed ────────────────────────────────────────────────
+    # Only run heavy NLP if Google ratings are missing AND text is long enough
+    has_all_google = all(v is not None for v in [g_food, g_service, g_atmosphere])
+    text_ok        = len(out["text_for_nlp"]) > 30
 
-    nlp_scores = {}
-    if not has_google_all and text_long_enough:
+    nlp = {}
+    if not has_all_google and text_ok:
         lang = out["language"][:2] if out["language"] else "en"
-        nlp_scores = run_nlp_on_text(out["text_for_nlp"], lang)
+        print(f"    → Running NLP on text ({len(out['text_for_nlp'])} chars, {lang})")
+        nlp = run_nlp(out["text_for_nlp"], lang)
 
-    # ── Final aspect scores: Google > context-derived > NLP ──────────────────
-    noise_score      = context_scores.get("reviewContext/Noise level")
-    wait_score       = context_scores.get("reviewContext/Wait time")
-    parking_score    = context_scores.get("reviewContext/Parking")
-    parking_opt_score= context_scores.get("reviewContext/Parking options")
-    wheelchair_score = context_scores.get("reviewContext/Wheelchair accessibility")
-    veg_score        = context_scores.get("reviewContext/Vegetarian options")
-    kid_score        = context_scores.get("reviewContext/Kid-friendliness")
+    # ── Merge: Google > context-derived > NLP ─────────────────────────────────
+    out["score_food"]        = _first(g_food,
+                                      nlp.get("Food Quality"),
+                                      nlp.get("Curry & Sauce"))
+    out["score_service"]     = _first(g_service,
+                                      _avg(ctx_score("reviewContext/Wait time"),
+                                           nlp.get("Service & Staff")))
+    out["score_ambience"]    = _first(g_atmosphere,
+                                      _avg(ctx_score("reviewContext/Noise level"),
+                                           nlp.get("Ambience & Atmosphere")))
+    out["score_noise"]       = _first(ctx_score("reviewContext/Noise level"),
+                                      nlp.get("Ambience & Atmosphere"))
+    out["score_wait_time"]   = _first(ctx_score("reviewContext/Wait time"),
+                                      nlp.get("Service & Staff"))
+    out["score_parking"]     = _first(
+                                      ctx_score("reviewContext/Parking"),
+                                      ctx_score("reviewContext/Parking options"),
+                                      ctx_score("reviewContext/Parking space"),
+                                      nlp.get("Location & Accessibility"))
+    out["score_wheelchair"]  = _first(ctx_score("reviewContext/Wheelchair accessibility"),
+                                      nlp.get("Location & Accessibility"))
+    out["score_vegetarian"]  = _first(ctx_score("reviewContext/Vegetarian options"),
+                                      nlp.get("Vegetarian & Vegan Options"))
+    out["score_kid_friendly"]= _first(ctx_score("reviewContext/Kid-friendliness"))
+    out["score_price"]       = nlp.get("Price & Value")
+    out["score_authenticity"]= nlp.get("Authenticity")
+    out["score_spice"]       = nlp.get("Spice Level")
+    out["score_cleanliness"] = nlp.get("Cleanliness & Hygiene")
+    out["score_chicken"]     = nlp.get("Chicken Dishes")
+    out["score_lamb"]        = nlp.get("Lamb & Mutton Dishes")
+    out["score_vegan_dishes"]= nlp.get("Vegetarian & Vegan Options")
+    out["score_bread_rice"]  = nlp.get("Bread & Rice")
+    out["score_starters"]    = nlp.get("Starters & Street Food")
+    out["score_overall_nlp"] = nlp.get("Overall Experience")
 
-    def avg_nonnull(*args):
-        vals = [a for a in args if a is not None]
-        return round(sum(vals)/len(vals), 2) if vals else None
-
-    out["score_food"]          = _first(g_food,
-                                        nlp_scores.get("Food Quality"),
-                                        nlp_scores.get("Curry & Sauce"))
-    out["score_service"]       = _first(g_service,
-                                        avg_nonnull(wait_score,
-                                                    nlp_scores.get("Service & Staff")))
-    out["score_ambience"]      = _first(g_atmosphere,
-                                        avg_nonnull(noise_score,
-                                                    nlp_scores.get("Ambience & Atmosphere")))
-    out["score_noise"]         = _first(noise_score,
-                                        nlp_scores.get("Ambience & Atmosphere"))
-    out["score_wait_time"]     = _first(wait_score,
-                                        nlp_scores.get("Service & Staff"))
-    out["score_parking"]       = _first(parking_score, parking_opt_score,
-                                        nlp_scores.get("Location & Accessibility"))
-    out["score_wheelchair"]    = _first(wheelchair_score,
-                                        nlp_scores.get("Location & Accessibility"))
-    out["score_vegetarian"]    = _first(veg_score,
-                                        nlp_scores.get("Vegetarian & Vegan Options"))
-    out["score_kid_friendly"]  = _first(kid_score)
-    out["score_price"]         = nlp_scores.get("Price & Value")
-    out["score_authenticity"]  = nlp_scores.get("Authenticity")
-    out["score_spice"]         = nlp_scores.get("Spice Level")
-    out["score_cleanliness"]   = nlp_scores.get("Cleanliness & Hygiene")
-    out["score_chicken"]       = nlp_scores.get("Chicken Dishes")
-    out["score_lamb"]          = nlp_scores.get("Lamb & Mutton Dishes")
-    out["score_vegan_dishes"]  = nlp_scores.get("Vegetarian & Vegan Options")
-    out["score_bread_rice"]    = nlp_scores.get("Bread & Rice")
-    out["score_starters"]      = nlp_scores.get("Starters & Street Food")
-    out["score_overall_nlp"]   = nlp_scores.get("Overall Experience")
-
-    # ── Credibility weight ────────────────────────────────────────────────────
+    # ── Reviewer credibility weight ───────────────────────────────────────────
     n = out["reviewer_review_count"] or 1
     out["credibility_weight"] = round(min(1.0, 0.3 + (n / 100) * 0.7), 3)
 
     # ── Data source tag ───────────────────────────────────────────────────────
     out["data_source"] = (
-        "google_ratings"  if has_google_all else
-        "context_fields"  if context_scores else
-        "nlp_text"        if nlp_scores else
+        "google_ratings" if has_all_google else
+        "context_scored" if ctx_scores     else
+        "nlp_text"       if nlp            else
         "no_data"
     )
     out["processed_at"] = datetime.now().isoformat()
@@ -464,49 +446,42 @@ def process_row(row: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import nltk
     nltk.download("punkt", quiet=True)
+    nltk.download("punkt_tab", quiet=True)
 
-    if SHEET_ID == "YOUR_SHEET_ID_HERE":
-        print("ERROR: Set SHEET_ID at the top of this file")
-        print("Find it in your Google Sheet URL:")
-        print("https://docs.google.com/spreadsheets/d/THIS_PART/edit")
-        exit(1)
+    print("=" * 60)
+    print("PROCESS REVIEWS — Oulu Restaurant Sentiment")
+    print("=" * 60)
 
-    if APPS_SCRIPT_URL == "YOUR_APPS_SCRIPT_URL_HERE":
-        print("ERROR: Set APPS_SCRIPT_URL at the top of this file")
-        exit(1)
-
-    print("="*60)
-    print("PROCESS REVIEWS — No credentials needed")
-    print("="*60)
-
-    raw_df = read_sheet_public(SHEET_ID, RAW_REVIEWS_GID)
+    raw_df = read_raw_reviews()
     if raw_df.empty:
-        print("No data. Run Make.com scenario first.")
-        exit()
+        print("No reviews found. Run your Make.com scenario first.")
+        sys.exit(0)
 
-    results     = []
-    source_tally = {"google_ratings": 0, "context_fields": 0,
-                    "nlp_text": 0, "no_data": 0}
+    results      = []
+    source_tally = {}
 
     for i, row in raw_df.iterrows():
-        name = str(row.get("title", row.get("name", "?")))[:35]
+        name = str(row.get("title", row.get("name", "Unknown")))[:40]
         print(f"[{i+1}/{len(raw_df)}] {name}")
-        result = process_row(row.to_dict())
-        results.append(result)
-        source_tally[result["data_source"]] = \
-            source_tally.get(result["data_source"], 0) + 1
+        processed = process_row(row.to_dict())
+        results.append(processed)
+        src = processed["data_source"]
+        source_tally[src] = source_tally.get(src, 0) + 1
 
-    df_out = pd.DataFrame(results)
+    out_df = pd.DataFrame(results)
 
     print(f"\nData source breakdown:")
-    for src, count in source_tally.items():
-        pct = round(100*count/len(results)) if results else 0
-        print(f"  {src:<20} {count:>4} ({pct}%)")
+    for src, count in sorted(source_tally.items(),
+                              key=lambda x: -x[1]):
+        pct = round(100 * count / len(results))
+        bar = "█" * (pct // 5)
+        print(f"  {src:<20} {bar:<20} {count:>4} ({pct}%)")
 
-    print(f"\nWriting {len(df_out)} rows back via Apps Script...")
-    written = write_processed(df_out, APPS_SCRIPT_URL)
-    print(f"Done — {written} rows written to 'processed' tab.")
-    print("Your dashboard will now show fresh data.")
+    print()
+    write_processed(out_df)
+    print("\nAll done! Dashboard will show updated data.")
+    print(f"Processed tab has {len(out_df.columns)} columns.")
