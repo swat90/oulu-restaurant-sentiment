@@ -1,11 +1,7 @@
-# Dashboard-only requirements — for Streamlit Cloud deployment
-# Lightweight: no torch, no transformers, no sentence-transformers
-# Dashboard reads pre-processed data from Google Sheets via public CSV
-# Heavy ML packages (torch, transformers etc) only needed for process_reviews.py
-# which runs locally or via GitHub Actions — NOT on Streamlit Cloud
-
-streamlit==1.35.0
-pandas==2.2.2
-numpy==1.26.4
-plotly==5.22.0
-requests==2.31.0
+# Dashboard-only — Streamlit Cloud deployment
+# No ML packages — dashboard only reads pre-processed CSV from Google Sheets
+streamlit>=1.35.0,<2.0.0
+pandas>=2.0.0,<3.0.0
+numpy>=1.24.0,<2.0.0
+plotly>=5.0.0,<6.0.0
+requests>=2.28.0
