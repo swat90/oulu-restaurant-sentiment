@@ -503,12 +503,6 @@ def main():
     m2.metric(T["metrics"]["rests"], df["restaurant"].nunique())
     m3.metric(T["metrics"]["avg_stars"], f'{df["review_stars"].mean():.2f} ★'
                                     if "review_stars" in df.columns else "–")
-    m4.metric(T["metrics"]["fi_reviews"], int(df["language"].str.startswith("fi").sum())
-                                    if "language" in df.columns else 0)
-    m5.metric(T["metrics"]["en_reviews"], int(df["language"].str.startswith("en").sum())
-                                    if "language" in df.columns else 0)
-    m6.metric(T["metrics"]["owner_resp"], int(df["owner_responded"].sum())
-                                    if "owner_responded" in df.columns else 0)
 
     # Data source info
     if "data_source" in df.columns:
