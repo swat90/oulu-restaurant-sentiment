@@ -56,10 +56,7 @@ TRANSLATIONS = {
         "metrics": {
             "total":     "Total Reviews",
             "rests":     "Restaurants",
-            "avg_stars": "Avg Stars",
-            "fi_reviews":"Finnish Reviews",
-            "en_reviews":"English Reviews",
-            "owner_resp":"Owner Responses",
+            "avg_stars": "Avg Stars"
         },
         "data_source_title": "How scores were computed",
         "source_labels": {
@@ -113,9 +110,6 @@ TRANSLATIONS = {
             "total":     "Arvosteluja yhteensä",
             "rests":     "Ravintoloita",
             "avg_stars": "Keskim. tähdet",
-            "fi_reviews":"Suomenkieliset arvostelut",
-            "en_reviews":"Englanninkieliset arvostelut",
-            "owner_resp":"Omistajan vastaukset",
         },
         "data_source_title": "Miten pisteet laskettiin",
         "source_labels": {
